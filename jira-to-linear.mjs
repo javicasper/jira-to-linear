@@ -13,9 +13,11 @@ const CONFIG_PATH = join(homedir(), ".jira-to-linear.json");
 const OAUTH_PORT = 9876;
 const REDIRECT_URI = `http://localhost:${OAUTH_PORT}/callback`;
 
-// OAuth credentials
-const JIRA_CLIENT_ID = "jFhDVgInCBiN7zcXWYh3nrP9XvdIF8tD";
-const LINEAR_CLIENT_ID = ""; // TODO: añadir cuando lo crees
+// OAuth credentials - se pueden sobreescribir con variables de entorno
+const JIRA_CLIENT_ID = process.env.JIRA_CLIENT_ID || "jFhDVgInCBiN7zcXWYh3nrP9XvdIF8tD";
+const JIRA_CLIENT_SECRET = process.env.JIRA_CLIENT_SECRET || "";
+const LINEAR_CLIENT_ID = process.env.LINEAR_CLIENT_ID || "a4cdef6febf8d5c63b5032a1bc597e2d";
+const LINEAR_CLIENT_SECRET = process.env.LINEAR_CLIENT_SECRET || "";
 
 // PKCE helpers
 function generateCodeVerifier() {
@@ -136,7 +138,7 @@ async function jiraOAuth() {
     "https://auth.atlassian.com/oauth/token",
     JIRA_CLIENT_ID,
     "read:jira-work read:jira-user offline_access",
-    { audience: "api.atlassian.com" }
+    { audience: "api.atlassian.com", client_secret: JIRA_CLIENT_SECRET }
   );
 
   // Get accessible resources (Jira sites)
@@ -189,11 +191,37 @@ async function refreshJiraToken(refreshToken) {
     body: new URLSearchParams({
       grant_type: "refresh_token",
       client_id: JIRA_CLIENT_ID,
+      client_secret: JIRA_CLIENT_SECRET,
       refresh_token: refreshToken,
     }),
   });
   if (!res.ok) throw new Error("Failed to refresh Jira token");
   return res.json();
+}
+
+// Linear OAuth
+async function linearOAuth() {
+  console.log("\n📐 Iniciando sesión en Linear...");
+
+  const tokens = await oauthFlow(
+    "https://linear.app/oauth/authorize",
+    "https://api.linear.app/oauth/token",
+    LINEAR_CLIENT_ID,
+    "read,write",
+    { client_secret: LINEAR_CLIENT_SECRET }
+  );
+
+  // Get user info
+  const linear = new LinearClient({ accessToken: tokens.access_token });
+  const viewer = await linear.viewer;
+
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    userId: viewer.id,
+    displayName: viewer.name,
+    email: viewer.email,
+  };
 }
 
 function loadConfig() {
@@ -254,10 +282,10 @@ async function setupCredentials() {
     console.log(`✅ Jira: ${config.jira.displayName} en ${config.jira.siteName}`);
   }
 
-  // Linear - por ahora mantenemos API key hasta que configures OAuth
-  if (config.linear?.apiKey) {
+  // Linear OAuth
+  if (config.linear?.accessToken) {
     const useExisting = await confirm({
-      message: "¿Usar cuenta de Linear guardada?",
+      message: `¿Usar cuenta de Linear guardada? (${config.linear.displayName})`,
       default: true,
     });
     if (!useExisting) {
@@ -266,24 +294,15 @@ async function setupCredentials() {
   }
 
   if (!config.linear) {
-    console.log("\n📐 Configura tu cuenta de Linear:");
-    const apiKey = await password({
-      message: "API Key de Linear (créala en Linear > Settings > API):",
-      mask: "*",
-    });
-
-    config.linear = { apiKey };
-  }
-
-  // Test Linear
-  try {
-    const linear = new LinearClient({ apiKey: config.linear.apiKey });
-    const viewer = await linear.viewer;
-    console.log(`✅ Linear: conectado como ${viewer.name}`);
-  } catch (e) {
-    console.error("❌ Error conectando a Linear:", e.message);
-    delete config.linear;
-    return setupCredentials();
+    try {
+      config.linear = await linearOAuth();
+      console.log(`✅ Linear: conectado como ${config.linear.displayName}`);
+    } catch (e) {
+      console.error("❌ Error conectando a Linear:", e.message);
+      return setupCredentials();
+    }
+  } else {
+    console.log(`✅ Linear: ${config.linear.displayName}`);
   }
 
   // Guardar config
@@ -559,7 +578,7 @@ async function main() {
   }
 
   console.log("🔌 Conectando a Linear...");
-  const linear = new LinearClient({ apiKey: config.linear.apiKey });
+  const linear = new LinearClient({ accessToken: config.linear.accessToken });
 
   const me = await linear.viewer;
   const teams = await me.teams();
@@ -720,6 +739,187 @@ async function main() {
     const id = jiraToLinearId.get(key);
     console.log(`- ${key} -> ${id ? "OK" : "FALLÓ"}`);
   }
+
+  // Preguntar si quiere continuar
+  const continueChoice = await select({
+    message: "¿Qué quieres hacer ahora?",
+    choices: [
+      { name: "Migrar más historias del mismo proyecto", value: "same" },
+      { name: "Cambiar de proyecto", value: "change" },
+      { name: "Salir", value: "exit" },
+    ],
+  });
+
+  if (continueChoice === "exit") {
+    console.log("\n👋 ¡Hasta luego!");
+    return;
+  }
+
+  if (continueChoice === "change") {
+    return main(); // Reinicia todo el flujo
+  }
+
+  // continueChoice === "same" - volver a buscar historias del mismo proyecto
+  return continueFromSearch(jqlOverride, linearTeamId, linearProjectId, linear);
+}
+
+async function continueFromSearch(jql, linearTeamId, linearProjectId, linear) {
+  console.log("\n🔎 Buscando historias en Jira...");
+  const stories = await jiraSearchIssues(jql, [
+    "summary",
+    "description",
+    "subtasks",
+    "priority",
+    "labels",
+    "status",
+  ]);
+
+  if (!stories.length) {
+    console.log("No hay más historias con ese filtro.");
+    const retry = await confirm({
+      message: "¿Quieres cambiar de proyecto?",
+      default: true,
+    });
+    if (retry) return main();
+    return;
+  }
+
+  let selectedStoryKeys = [];
+
+  while (selectedStoryKeys.length === 0) {
+    const filterText = await input({
+      message: "Filtrar historias (ENTER para ver todas):",
+      default: "",
+    });
+
+    const filteredStories = filterText.trim()
+      ? stories.filter((s) => {
+          const text = `${s.key} ${s.fields?.summary ?? ""}`.toLowerCase();
+          return text.includes(filterText.toLowerCase());
+        })
+      : stories;
+
+    if (filteredStories.length === 0) {
+      console.log(`No hay historias que coincidan con "${filterText}". Intenta de nuevo.`);
+      continue;
+    }
+
+    console.log(`📋 ${filteredStories.length} historias encontradas:`);
+
+    selectedStoryKeys = await checkbox({
+      message: "Selecciona las historias a migrar (espacio para marcar):",
+      pageSize: 15,
+      choices: filteredStories.map((i) => ({
+        name: `${i.key} — ${i.fields?.summary ?? ""}`,
+        value: i.key,
+      })),
+    });
+
+    if (selectedStoryKeys.length === 0) {
+      const retry = await confirm({
+        message: "No seleccionaste ninguna. ¿Quieres filtrar de nuevo?",
+        default: true,
+      });
+      if (!retry) return;
+    }
+  }
+
+  console.log("🚚 Migrando a Linear...");
+
+  const jiraToLinearId = new Map();
+
+  for (const key of selectedStoryKeys) {
+    const story = stories.find((s) => s.key === key);
+    const summary = story?.fields?.summary ?? key;
+
+    const full = await getJiraIssue(key, [
+      "summary",
+      "description",
+      "subtasks",
+      "priority",
+      "labels",
+      "status",
+    ]);
+
+    const mdDescription = adfToMarkdown(full.fields?.description);
+    const header =
+      `**Migrado desde Jira:** ${key}\n` +
+      `${jiraIssueUrl(key)}\n\n` +
+      `---\n\n`;
+
+    const createRes = await linear.createIssue({
+      title: summary,
+      description: header + (mdDescription || "_(Sin descripción)_"),
+      teamId: linearTeamId,
+      projectId: linearProjectId ?? undefined,
+    });
+
+    if (!createRes.success) {
+      console.error(`❌ Fallo creando la historia ${key} en Linear`);
+      continue;
+    }
+
+    const linearIssue = await createRes.issue;
+    jiraToLinearId.set(key, linearIssue.id);
+
+    console.log(`✅ ${key} -> Linear (${linearIssue.identifier})`);
+
+    const subtasks = full.fields?.subtasks || [];
+    for (const st of subtasks) {
+      const stKey = st.key;
+      const stFull = await getJiraIssue(stKey, ["summary", "description"]);
+
+      const stTitle = stFull.fields?.summary ?? stKey;
+      const stDesc = adfToMarkdown(stFull.fields?.description);
+
+      const stHeader =
+        `**Subtarea migrada desde Jira:** ${stKey}\n` +
+        `${jiraIssueUrl(stKey)}\n\n` +
+        `**Parent (Jira):** ${key}\n\n` +
+        `---\n\n`;
+
+      const stCreateRes = await linear.createIssue({
+        title: stTitle,
+        description: stHeader + (stDesc || "_(Sin descripción)_"),
+        teamId: linearTeamId,
+        projectId: linearProjectId ?? undefined,
+        parentId: linearIssue.id,
+      });
+
+      if (stCreateRes.success) {
+        const stIssue = await stCreateRes.issue;
+        console.log(`   ↳ ✅ ${stKey} -> ${stIssue.identifier}`);
+      } else {
+        console.log(`   ↳ ❌ Fallo creando sub-issue para ${stKey}`);
+      }
+    }
+  }
+
+  console.log("\n🎉 Hecho. Historias migradas:");
+  for (const key of selectedStoryKeys) {
+    const id = jiraToLinearId.get(key);
+    console.log(`- ${key} -> ${id ? "OK" : "FALLÓ"}`);
+  }
+
+  const continueChoice = await select({
+    message: "¿Qué quieres hacer ahora?",
+    choices: [
+      { name: "Migrar más historias del mismo proyecto", value: "same" },
+      { name: "Cambiar de proyecto", value: "change" },
+      { name: "Salir", value: "exit" },
+    ],
+  });
+
+  if (continueChoice === "exit") {
+    console.log("\n👋 ¡Hasta luego!");
+    return;
+  }
+
+  if (continueChoice === "change") {
+    return main();
+  }
+
+  return continueFromSearch(jql, linearTeamId, linearProjectId, linear);
 }
 
 // Only run main when executed directly, not when imported
