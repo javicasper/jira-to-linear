@@ -20,6 +20,40 @@ const JIRA_CLIENT_SECRET = process.env.JIRA_CLIENT_SECRET || "";
 const LINEAR_CLIENT_ID = process.env.LINEAR_CLIENT_ID || "a4cdef6febf8d5c63b5032a1bc597e2d";
 const LINEAR_CLIENT_SECRET = process.env.LINEAR_CLIENT_SECRET || "";
 
+// Symbol for exit
+const EXIT_SYMBOL = Symbol("exit");
+
+// Select con soporte de ESC para salir
+async function selectWithEsc(options) {
+  const controller = new AbortController();
+
+  // Listener para ESC
+  const onKeypress = (data) => {
+    if (data.toString() === "\x1b") {
+      controller.abort();
+    }
+  };
+
+  process.stdin.setRawMode?.(true);
+  process.stdin.on("data", onKeypress);
+
+  try {
+    const result = await select({
+      ...options,
+      message: `${options.message} (ESC para salir)`,
+    }, { signal: controller.signal });
+    return result;
+  } catch (e) {
+    if (e.name === "AbortPromptError" || controller.signal.aborted) {
+      return EXIT_SYMBOL;
+    }
+    throw e;
+  } finally {
+    process.stdin.removeListener("data", onKeypress);
+    process.stdin.setRawMode?.(false);
+  }
+}
+
 // PKCE helpers
 function generateCodeVerifier() {
   return randomBytes(32).toString("base64url");
@@ -240,33 +274,24 @@ function saveConfig(config) {
   writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
 }
 
-async function setupCredentials() {
-  const config = loadConfig();
-
-  console.log("🔐 Configuración de credenciales\n");
+async function setupCredentials(forceReset = false) {
+  let config = forceReset ? {} : loadConfig();
+  let needsSave = false;
 
   // Jira OAuth
   if (config.jira?.accessToken && config.jira?.cloudId) {
-    const useExisting = await confirm({
-      message: `¿Usar cuenta de Jira guardada? (${config.jira.displayName} en ${config.jira.siteName})`,
-      default: true,
-    });
-    if (!useExisting) {
-      delete config.jira;
-    } else {
-      // Try to refresh token if we have one
-      if (config.jira.refreshToken) {
-        try {
-          const newTokens = await refreshJiraToken(config.jira.refreshToken);
-          config.jira.accessToken = newTokens.access_token;
-          if (newTokens.refresh_token) {
-            config.jira.refreshToken = newTokens.refresh_token;
-          }
-          saveConfig(config);
-        } catch (e) {
-          console.log("⚠️ Token expirado, necesitas volver a iniciar sesión");
-          delete config.jira;
+    // Refresh token si existe
+    if (config.jira.refreshToken) {
+      try {
+        const newTokens = await refreshJiraToken(config.jira.refreshToken);
+        config.jira.accessToken = newTokens.access_token;
+        if (newTokens.refresh_token) {
+          config.jira.refreshToken = newTokens.refresh_token;
         }
+        needsSave = true;
+      } catch (e) {
+        console.log("⚠️ Token de Jira expirado, necesitas volver a iniciar sesión");
+        delete config.jira;
       }
     }
   }
@@ -274,46 +299,30 @@ async function setupCredentials() {
   if (!config.jira) {
     try {
       config.jira = await jiraOAuth();
-      console.log(`✅ Jira: conectado como ${config.jira.displayName} en ${config.jira.siteName}`);
+      needsSave = true;
     } catch (e) {
       console.error("❌ Error conectando a Jira:", e.message);
       return setupCredentials();
     }
-  } else {
-    console.log(`✅ Jira: ${config.jira.displayName} en ${config.jira.siteName}`);
   }
+  console.log(`✅ Jira: ${config.jira.displayName} (${config.jira.siteName})`);
 
   // Linear OAuth
-  if (config.linear?.accessToken) {
-    const useExisting = await confirm({
-      message: `¿Usar cuenta de Linear guardada? (${config.linear.displayName})`,
-      default: true,
-    });
-    if (!useExisting) {
-      delete config.linear;
-    }
-  }
-
-  if (!config.linear) {
+  if (!config.linear?.accessToken) {
     try {
       config.linear = await linearOAuth();
-      console.log(`✅ Linear: conectado como ${config.linear.displayName}`);
+      needsSave = true;
     } catch (e) {
       console.error("❌ Error conectando a Linear:", e.message);
       return setupCredentials();
     }
-  } else {
-    console.log(`✅ Linear: ${config.linear.displayName}`);
   }
+  console.log(`✅ Linear: ${config.linear.displayName}`);
 
-  // Guardar config
-  const save = await confirm({
-    message: "¿Guardar credenciales para futuras ejecuciones?",
-    default: true,
-  });
-  if (save) {
+  // Guardar solo si hubo cambios
+  if (needsSave) {
     saveConfig(config);
-    console.log(`💾 Guardado en ${CONFIG_PATH}\n`);
+    console.log(`💾 Credenciales guardadas\n`);
   }
 
   return config;
@@ -491,12 +500,19 @@ function jiraIssueUrl(key) {
 }
 
 async function main() {
-  config = await setupCredentials();
+  const args = process.argv.slice(2);
+  const forceReset = args.includes("--reset") || args.includes("-r");
+
+  if (forceReset) {
+    console.log("🔄 Reseteando credenciales...\n");
+  }
+
+  config = await setupCredentials(forceReset);
 
   console.log("\n🔎 Cargando proyectos de Jira...");
   const jiraProjects = await listJiraProjects();
 
-  const jiraProjectKey = await select({
+  const jiraProjectKey = await selectWithEsc({
     message: "Selecciona el proyecto de Jira:",
     pageSize: 15,
     choices: jiraProjects.map((p) => ({
@@ -504,6 +520,11 @@ async function main() {
       value: p.key,
     })),
   });
+
+  if (jiraProjectKey === EXIT_SYMBOL) {
+    console.log("\n👋 ¡Hasta luego!");
+    return;
+  }
 
   const onlyOpen = await confirm({
     message: "¿Solo historias NO finalizadas? (filtra Done/Closed)",
@@ -585,11 +606,16 @@ async function main() {
   const teams = await me.teams();
   const teamNodes = teams.nodes;
 
-  const linearTeamId = await select({
-    message: "Selecciona el Team de Linear donde crear las issues:",
+  const linearTeamId = await selectWithEsc({
+    message: "Selecciona el Team de Linear:",
     pageSize: 12,
     choices: teamNodes.map((t) => ({ name: t.name, value: t.id })),
   });
+
+  if (linearTeamId === EXIT_SYMBOL) {
+    console.log("\n👋 ¡Hasta luego!");
+    return;
+  }
 
   const linearTeam = teamNodes.find((t) => t.id === linearTeamId);
 
@@ -620,11 +646,16 @@ async function main() {
       .map((p) => ({ name: p.name, value: { type: "existing", id: p.id } })),
   ];
 
-  const projectChoice = await select({
-    message: "Selecciona el Project de Linear (opcional):",
+  const projectChoice = await selectWithEsc({
+    message: "Selecciona el Project de Linear:",
     pageSize: 15,
     choices: projectChoices,
   });
+
+  if (projectChoice === EXIT_SYMBOL) {
+    console.log("\n👋 ¡Hasta luego!");
+    return;
+  }
 
   let linearProjectId = null;
 
@@ -742,16 +773,15 @@ async function main() {
   }
 
   // Preguntar si quiere continuar
-  const continueChoice = await select({
+  const continueChoice = await selectWithEsc({
     message: "¿Qué quieres hacer ahora?",
     choices: [
       { name: "Migrar más historias del mismo proyecto", value: "same" },
       { name: "Cambiar de proyecto", value: "change" },
-      { name: "Salir", value: "exit" },
     ],
   });
 
-  if (continueChoice === "exit") {
+  if (continueChoice === EXIT_SYMBOL) {
     console.log("\n👋 ¡Hasta luego!");
     return;
   }
@@ -902,16 +932,15 @@ async function continueFromSearch(jql, linearTeamId, linearProjectId, linear) {
     console.log(`- ${key} -> ${id ? "OK" : "FALLÓ"}`);
   }
 
-  const continueChoice = await select({
+  const continueChoice = await selectWithEsc({
     message: "¿Qué quieres hacer ahora?",
     choices: [
       { name: "Migrar más historias del mismo proyecto", value: "same" },
       { name: "Cambiar de proyecto", value: "change" },
-      { name: "Salir", value: "exit" },
     ],
   });
 
-  if (continueChoice === "exit") {
+  if (continueChoice === EXIT_SYMBOL) {
     console.log("\n👋 ¡Hasta luego!");
     return;
   }
