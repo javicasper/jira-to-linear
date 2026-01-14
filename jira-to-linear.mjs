@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "dotenv/config";
 import { select, checkbox, confirm, input, password } from "@inquirer/prompts";
 import { fetch } from "undici";
 import { LinearClient } from "@linear/sdk";
