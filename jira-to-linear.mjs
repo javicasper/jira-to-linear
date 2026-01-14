@@ -5,8 +5,196 @@ import { LinearClient } from "@linear/sdk";
 import { homedir } from "os";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
+import { createServer } from "http";
+import { randomBytes, createHash } from "crypto";
+import { URL } from "url";
 
 const CONFIG_PATH = join(homedir(), ".jira-to-linear.json");
+const OAUTH_PORT = 9876;
+const REDIRECT_URI = `http://localhost:${OAUTH_PORT}/callback`;
+
+// OAuth credentials
+const JIRA_CLIENT_ID = "jFhDVgInCBiN7zcXWYh3nrP9XvdIF8tD";
+const LINEAR_CLIENT_ID = ""; // TODO: añadir cuando lo crees
+
+// PKCE helpers
+function generateCodeVerifier() {
+  return randomBytes(32).toString("base64url");
+}
+
+function generateCodeChallenge(verifier) {
+  return createHash("sha256").update(verifier).digest("base64url");
+}
+
+// Open browser cross-platform
+async function openBrowser(url) {
+  const { exec } = await import("child_process");
+  const cmd = process.platform === "darwin" ? "open" : process.platform === "win32" ? "start" : "xdg-open";
+  exec(`${cmd} "${url}"`);
+}
+
+// OAuth flow
+async function oauthFlow(authUrl, tokenUrl, clientId, scopes, extraTokenParams = {}) {
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = generateCodeChallenge(codeVerifier);
+  const state = randomBytes(16).toString("hex");
+
+  const authParams = new URLSearchParams({
+    client_id: clientId,
+    redirect_uri: REDIRECT_URI,
+    response_type: "code",
+    scope: scopes,
+    state,
+    code_challenge: codeChallenge,
+    code_challenge_method: "S256",
+  });
+
+  const fullAuthUrl = `${authUrl}?${authParams}`;
+
+  return new Promise((resolve, reject) => {
+    const server = createServer(async (req, res) => {
+      const reqUrl = new URL(req.url, `http://localhost:${OAUTH_PORT}`);
+
+      if (reqUrl.pathname === "/callback") {
+        const code = reqUrl.searchParams.get("code");
+        const returnedState = reqUrl.searchParams.get("state");
+        const error = reqUrl.searchParams.get("error");
+
+        if (error) {
+          res.writeHead(400, { "Content-Type": "text/html" });
+          res.end("<h1>Error de autorizacion</h1><p>Puedes cerrar esta ventana.</p>");
+          server.close();
+          reject(new Error(error));
+          return;
+        }
+
+        if (returnedState !== state) {
+          res.writeHead(400, { "Content-Type": "text/html" });
+          res.end("<h1>Error: state no coincide</h1>");
+          server.close();
+          reject(new Error("State mismatch"));
+          return;
+        }
+
+        // Exchange code for token
+        try {
+          const tokenParams = new URLSearchParams({
+            grant_type: "authorization_code",
+            client_id: clientId,
+            code,
+            redirect_uri: REDIRECT_URI,
+            code_verifier: codeVerifier,
+            ...extraTokenParams,
+          });
+
+          const tokenRes = await fetch(tokenUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: tokenParams,
+          });
+
+          if (!tokenRes.ok) {
+            const errText = await tokenRes.text();
+            throw new Error(`Token error: ${tokenRes.status} ${errText}`);
+          }
+
+          const tokens = await tokenRes.json();
+
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end("<h1>Autorizacion exitosa!</h1><p>Puedes cerrar esta ventana y volver a la terminal.</p>");
+          server.close();
+          resolve(tokens);
+        } catch (e) {
+          res.writeHead(500, { "Content-Type": "text/html" });
+          res.end(`<h1>Error</h1><p>${e.message}</p>`);
+          server.close();
+          reject(e);
+        }
+      }
+    });
+
+    server.listen(OAUTH_PORT, () => {
+      console.log(`\n🌐 Abriendo navegador para autorización...`);
+      console.log(`   Si no se abre, visita: ${fullAuthUrl}\n`);
+      openBrowser(fullAuthUrl);
+    });
+
+    // Timeout after 5 minutes
+    setTimeout(() => {
+      server.close();
+      reject(new Error("OAuth timeout"));
+    }, 5 * 60 * 1000);
+  });
+}
+
+// Jira OAuth
+async function jiraOAuth() {
+  console.log("\n📋 Iniciando sesión en Jira...");
+
+  const tokens = await oauthFlow(
+    "https://auth.atlassian.com/authorize",
+    "https://auth.atlassian.com/oauth/token",
+    JIRA_CLIENT_ID,
+    "read:jira-work read:jira-user offline_access",
+    { audience: "api.atlassian.com" }
+  );
+
+  // Get accessible resources (Jira sites)
+  const resourcesRes = await fetch("https://api.atlassian.com/oauth/token/accessible-resources", {
+    headers: { Authorization: `Bearer ${tokens.access_token}` },
+  });
+  const resources = await resourcesRes.json();
+
+  if (!resources.length) {
+    throw new Error("No tienes acceso a ningún sitio de Jira");
+  }
+
+  let cloudId, siteName, siteUrl;
+  if (resources.length === 1) {
+    cloudId = resources[0].id;
+    siteName = resources[0].name;
+    siteUrl = resources[0].url;
+  } else {
+    const choice = await select({
+      message: "Selecciona el sitio de Jira:",
+      choices: resources.map((r) => ({ name: `${r.name} (${r.url})`, value: r })),
+    });
+    cloudId = choice.id;
+    siteName = choice.name;
+    siteUrl = choice.url;
+  }
+
+  // Get user info
+  const meRes = await fetch(`https://api.atlassian.com/ex/jira/${cloudId}/rest/api/3/myself`, {
+    headers: { Authorization: `Bearer ${tokens.access_token}` },
+  });
+  const me = await meRes.json();
+
+  return {
+    accessToken: tokens.access_token,
+    refreshToken: tokens.refresh_token,
+    cloudId,
+    siteName,
+    siteUrl,
+    email: me.emailAddress,
+    displayName: me.displayName,
+  };
+}
+
+// Refresh Jira token
+async function refreshJiraToken(refreshToken) {
+  const res = await fetch("https://auth.atlassian.com/oauth/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: JIRA_CLIENT_ID,
+      refresh_token: refreshToken,
+    }),
+  });
+  if (!res.ok) throw new Error("Failed to refresh Jira token");
+  return res.json();
+}
 
 function loadConfig() {
   if (existsSync(CONFIG_PATH)) {
@@ -28,40 +216,45 @@ async function setupCredentials() {
 
   console.log("🔐 Configuración de credenciales\n");
 
-  // Jira
-  if (config.jira?.baseUrl && config.jira?.email && config.jira?.apiToken) {
+  // Jira OAuth
+  if (config.jira?.accessToken && config.jira?.cloudId) {
     const useExisting = await confirm({
-      message: `¿Usar cuenta de Jira guardada? (${config.jira.email} en ${config.jira.baseUrl})`,
+      message: `¿Usar cuenta de Jira guardada? (${config.jira.displayName} en ${config.jira.siteName})`,
       default: true,
     });
     if (!useExisting) {
       delete config.jira;
+    } else {
+      // Try to refresh token if we have one
+      if (config.jira.refreshToken) {
+        try {
+          const newTokens = await refreshJiraToken(config.jira.refreshToken);
+          config.jira.accessToken = newTokens.access_token;
+          if (newTokens.refresh_token) {
+            config.jira.refreshToken = newTokens.refresh_token;
+          }
+          saveConfig(config);
+        } catch (e) {
+          console.log("⚠️ Token expirado, necesitas volver a iniciar sesión");
+          delete config.jira;
+        }
+      }
     }
   }
 
   if (!config.jira) {
-    console.log("\n📋 Configura tu cuenta de Jira:");
-    const baseUrl = await input({
-      message: "URL de Jira (ej: https://tu-empresa.atlassian.net):",
-      validate: (v) => v.startsWith("http") || "Debe empezar con http:// o https://",
-    });
-    const email = await input({
-      message: "Email de Jira:",
-      validate: (v) => v.includes("@") || "Introduce un email válido",
-    });
-    const apiToken = await password({
-      message: "API Token de Jira (créalo en https://id.atlassian.com/manage-profile/security/api-tokens):",
-      mask: "*",
-    });
-
-    config.jira = {
-      baseUrl: baseUrl.replace(/\/$/, ""),
-      email,
-      apiToken,
-    };
+    try {
+      config.jira = await jiraOAuth();
+      console.log(`✅ Jira: conectado como ${config.jira.displayName} en ${config.jira.siteName}`);
+    } catch (e) {
+      console.error("❌ Error conectando a Jira:", e.message);
+      return setupCredentials();
+    }
+  } else {
+    console.log(`✅ Jira: ${config.jira.displayName} en ${config.jira.siteName}`);
   }
 
-  // Linear
+  // Linear - por ahora mantenemos API key hasta que configures OAuth
   if (config.linear?.apiKey) {
     const useExisting = await confirm({
       message: "¿Usar cuenta de Linear guardada?",
@@ -80,24 +273,6 @@ async function setupCredentials() {
     });
 
     config.linear = { apiKey };
-  }
-
-  // Validar credenciales
-  console.log("\n🔍 Verificando credenciales...");
-
-  // Test Jira
-  const jiraAuth = "Basic " + Buffer.from(`${config.jira.email}:${config.jira.apiToken}`).toString("base64");
-  try {
-    const res = await fetch(`${config.jira.baseUrl}/rest/api/3/myself`, {
-      headers: { Authorization: jiraAuth, Accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`Status ${res.status}`);
-    const me = await res.json();
-    console.log(`✅ Jira: conectado como ${me.displayName}`);
-  } catch (e) {
-    console.error("❌ Error conectando a Jira:", e.message);
-    delete config.jira;
-    return setupCredentials();
   }
 
   // Test Linear
@@ -127,17 +302,17 @@ async function setupCredentials() {
 let config;
 
 async function jiraGET(path, params = {}) {
-  const url = new URL(`${config.jira.baseUrl}${path}`);
+  // OAuth uses Atlassian API gateway with cloudId
+  const baseUrl = `https://api.atlassian.com/ex/jira/${config.jira.cloudId}`;
+  const url = new URL(`${baseUrl}${path}`);
   for (const [k, v] of Object.entries(params)) {
     if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
   }
 
-  const jiraAuth = "Basic " + Buffer.from(`${config.jira.email}:${config.jira.apiToken}`).toString("base64");
-
   const res = await fetch(url, {
     method: "GET",
     headers: {
-      Authorization: jiraAuth,
+      Authorization: `Bearer ${config.jira.accessToken}`,
       Accept: "application/json",
     },
   });
@@ -292,7 +467,7 @@ async function getJiraIssue(keyOrId, fields = []) {
 }
 
 function jiraIssueUrl(key) {
-  return `${config.jira.baseUrl}/browse/${key}`;
+  return `${config.jira.siteUrl}/browse/${key}`;
 }
 
 async function main() {
