@@ -10,7 +10,8 @@
     "jira-to-linear.mjs"
   ],
   "scripts": {
-    "start": "node jira-to-linear.mjs"
+    "start": "node jira-to-linear.mjs",
+    "test": "node --test test/*.test.mjs"
   },
   "keywords": [
     "jira",

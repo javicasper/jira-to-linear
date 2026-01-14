@@ -328,7 +328,7 @@ async function jiraGET(path, params = {}) {
 
 // Jira Cloud suele devolver description en ADF (JSON). Convertimos lo básico a Markdown.
 // Si algo no se reconoce, lo metemos como JSON “pretty” en un bloque.
-function adfToMarkdown(adf) {
+export function adfToMarkdown(adf) {
   if (!adf || typeof adf !== "object") return "";
   if (!adf.content || !Array.isArray(adf.content)) return "";
 
@@ -722,7 +722,11 @@ async function main() {
   }
 }
 
-main().catch((e) => {
-  console.error("\n💥 Error:", e?.message || e);
-  process.exit(1);
-});
+// Only run main when executed directly, not when imported
+const isMainModule = import.meta.url === `file://${process.argv[1]}`;
+if (isMainModule) {
+  main().catch((e) => {
+    console.error("\n💥 Error:", e?.message || e);
+    process.exit(1);
+  });
+}
