@@ -24,7 +24,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/javicasper/jira-to-linear.git"
+  },
+  "homepage": "https://github.com/javicasper/jira-to-linear#readme",
+  "bugs": {
+    "url": "https://github.com/javicasper/jira-to-linear/issues"
   },
   "engines": {
     "node": ">=18.0.0"
