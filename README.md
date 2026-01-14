@@ -17,25 +17,27 @@ jira-to-linear
 
 ## Características
 
+- Autenticación OAuth (sin necesidad de crear API tokens manualmente)
 - Migra historias (Stories) y sus subtareas como sub-issues en Linear
 - Convierte descripciones de formato Jira (ADF) a Markdown
 - Permite crear proyectos nuevos en Linear o usar existentes
 - Filtra historias por texto en tiempo real
 - Guarda credenciales localmente para no pedirlas cada vez
+- ESC para salir de cualquier menú
 
-## Configuración
+## Autenticación
 
-La primera vez que ejecutes la herramienta te pedirá:
+La primera vez que ejecutes la herramienta:
 
-### Jira
-- **URL de Jira**: `https://tu-empresa.atlassian.net`
-- **Email**: Tu email de Atlassian
-- **API Token**: Créalo en [Atlassian API Tokens](https://id.atlassian.com/manage-profile/security/api-tokens)
+1. Se abrirá el navegador para **autorizar Jira**
+2. Se abrirá el navegador para **autorizar Linear**
+3. Las credenciales se guardan en `~/.jira-to-linear.json`
 
-### Linear
-- **API Key**: Créala en Linear > Settings > API > Personal API keys
+Para resetear credenciales:
 
-Las credenciales se guardan en `~/.jira-to-linear.json` para futuras ejecuciones.
+```bash
+jira-to-linear --reset
+```
 
 ## Flujo de migración
 
@@ -45,6 +47,7 @@ Las credenciales se guardan en `~/.jira-to-linear.json` para futuras ejecuciones
 4. Selecciona el equipo de Linear
 5. Crea un proyecto nuevo o selecciona uno existente
 6. La herramienta migra las historias y sus subtareas
+7. Continúa migrando más o cambia de proyecto
 
 ## Qué se migra
 
@@ -52,6 +55,13 @@ Las credenciales se guardan en `~/.jira-to-linear.json` para futuras ejecuciones
 - Descripción (convertida a Markdown)
 - Relación padre-hijo (subtareas como sub-issues)
 - Enlace de referencia al issue original de Jira
+
+## Controles
+
+- **↑↓** - Navegar
+- **Espacio** - Marcar/desmarcar (en checkbox)
+- **Enter** - Confirmar
+- **ESC** - Salir
 
 ## Requisitos
 

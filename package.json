@@ -1,10 +1,10 @@
 {
   "name": "@javierlopezr/jira-to-linear",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "CLI interactivo para migrar historias y subtareas de Jira a Linear",
   "type": "module",
   "bin": {
-    "jira-to-linear": "./jira-to-linear.mjs"
+    "jira-to-linear": "jira-to-linear.mjs"
   },
   "files": [
     "jira-to-linear.mjs"
